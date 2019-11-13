@@ -4,6 +4,7 @@ final class CTestEngine extends ArcanistUnitTestEngine {
     private $ctestBinary = 'ctest';
     private $covBinary = 'gcov';
     private $projectRoot;
+    private $buildDir;
     private $affectedTests;
     private $ctestbuild;
     private $coverage;
@@ -19,7 +20,7 @@ final class CTestEngine extends ArcanistUnitTestEngine {
     }
 
     public function shouldEchoTestResults() {
-        return true; // i.e. this engine does not output its own results.
+        return false; // i.e. this engine does not output its own results.
     }
 
     private function shouldGenerateCoverage() {
@@ -35,6 +36,7 @@ final class CTestEngine extends ArcanistUnitTestEngine {
     // helper function for loading test environment
     protected function loadEnvironment() {
         $this->projectRoot = $this->getWorkingCopy()->getProjectRoot();
+        $this->buildDir = $this->projectRoot."/bld";
         $config_path = $this->getWorkingCopy()->getProjectPath('.arcconfig');
 
         # TODO(featherless): Find a better way to configure the unit engine, possibly via .arcunit.
@@ -81,59 +83,87 @@ final class CTestEngine extends ArcanistUnitTestEngine {
         }
 
         if (array_key_exists('pre-build', $config['unit.ctest'])) {
+            # override build command: this can be use to build using custom scripts (e.g. build.sh)
+            # note that this command will be executed from the current buildDir, not from the project root,
+            # so you might need to use something like 'cd .. && ./build.sh'.
             $this->preBuildCommand = $config['unit.ctest']['pre-build'];
+        } else {
+            # generic CMake way to build a tree. This will execute make, nmake, ninja, or whatever is
+            # configured to build the project.
+            $this->preBuildCommand = 'cmake --build .';
         }
     }
 
-    public function run() {
-        $this->loadEnvironment();
+    private function getAllTests() {
+        $results = array();
 
-        if (!$this->getRunAllTests()) {
-            $paths = $this->getPaths();
-            if (empty($paths)) {
-                return array();
+        // lets ctest print a list of available tests
+        $future = new ExecFuture('ctest -N .');
+        $future->setCWD($this->buildDir);
+
+        list($builderror, $ctest_stdout, $ctest_stderr) = $future->resolve();
+        if ($builderror !== 0) {
+            return $results;
+        }
+
+        $lines = explode("\n", $ctest_stdout);
+        foreach($lines AS $line) {
+            $ret = preg_match("/Test +#\d+: (\w+)/", $line, $captures);
+            if ($ret != 1) {
+                continue;
+            }
+            // add test to results
+            array_push($results, $captures[1]);
+        }
+
+        return $results;
+    }
+
+    private function getTestsForPaths() {
+        # just a test hack
+        $look_here = $this->getPaths();
+        $run_tests = array();
+
+        foreach($look_here as $path_info) {
+            if ($path_info == 'src/uabase') {
+                return ['test_variant', 'test_string'];
             }
         }
 
-        $ctestargs = array();
-        foreach ($this->ctestbuild as $key => $value) {
-            $ctestargs []= "-$key \"$value\"";
-        }
+        // TODO: add a smart way to detect what needs to be tests
+        // for now we run simply all tests
+        return $this->getAllTests();
+    }
 
-        if (!empty($this->preBuildCommand)) {
-            $future = new ExecFuture($this->preBuildCommand);
-            $future->setCWD(Filesystem::resolvePath($this->getWorkingCopy()->getProjectRoot()));
-            $future->resolvex();
-        }
+    private function run_one_test($name) {
+        // run specified test using a RegEx match
+        $future = new ExecFuture('ctest -R ^'.$name.'$ .');
+        $future->setCWD($this->buildDir);
 
-        // Build and run unit tests
-        #$future = new ExecFuture('%C %C test',
-        #    $this->ctestbuildBinary, implode(' ', $ctestargs));
-        $future = new ExecFuture('ctest .');
-        $future->setCWD($this->projectRoot . '/bld');
-
+        // wait for future to complete
         list($builderror, $ctest_stdout, $ctest_stderr) = $future->resolve();
 
         if ($builderror !== 0) {
             return array(id(new ArcanistUnitTestResult())
                 ->setName("CTest engine")
-                ->setUserData($xcbuild_stderr)
+                ->setUserData($ctest_stderr)
                 ->setResult(ArcanistUnitTestResult::RESULT_BROKEN));
         }
 
+        // parse test output
         $lines = explode("\n", $ctest_stdout);
-        $results = array();
         foreach($lines AS $line) {
-            $ret = preg_match("/(\d+)\/(\d+) Test +#\d+: (\w+) \.+ + (Passed|Failed) + ([0-9.]+) sec/", $line, $captures);
+            $ret = preg_match("/(\d+)\/(\d+) Test +#(\d+): (\w+) \.+ + (Passed|Failed) + ([0-9.]+) sec/", $line, $captures);
             if ($ret != 1) {
                 continue;
             }
 
             $index    = $captures[1];
             $count    = $captures[2];
-            $name     = $captures[3];
-            $status   = $captures[4];
-            $duration = floatval($captures[5]);
+            $testnum  = $captures[3];
+            $name     = $captures[4];
+            $status   = $captures[5];
+            $duration = floatval($captures[6]);
 
             $result = new ArcanistUnitTestResult();
             $result->setName($name);
@@ -143,69 +173,46 @@ final class CTestEngine extends ArcanistUnitTestEngine {
                 $result->setResult(ArcanistUnitTestResult::RESULT_FAIL);
             }
             $result->setDuration($duration);
+            # print result
+            if ($this->renderer) {
+                print $this->renderer->renderUnitResult($result);
+            } else {
+                print("error: not renderer set.\n");
+            }
 
+            // we don't expect more than one result
+            return $result;
+        }
+
+        return null;
+    }
+
+    public function run() {
+        $results = array();
+
+        $this->loadEnvironment();
+
+        if ($this->getRunAllTests()) {
+            # execute all tests
+            $testnames = $this->getAllTests();
+        } else {
+            # execute only the tests for changed code
+            $testnames = $this->getTestsForPaths();
+        }
+
+        // build project
+        if (!empty($this->preBuildCommand)) {
+            $future = new ExecFuture($this->preBuildCommand);
+            $future->setCWD(Filesystem::resolvePath($this->buildDir));
+            $future->resolvex();
+        }
+
+        // run all configured tests
+        foreach($testnames AS $testname) {
+            $result = $this->run_one_test($testname);
             array_push($results, $result);
         }
+
         return $results;
-
-
-        // Extract coverage information
-        /*
-        $coverage = null;
-        if ($builderror === 0 && $this->shouldGenerateCoverage()) {
-            // Get the OBJROOT
-            $future = new ExecFuture('%C %C -showBuildSettings test',
-                $this->ctestbuildBinary, implode(' ', $ctestargs));
-            $future->setCWD(Filesystem::resolvePath($this->getWorkingCopy()->getProjectRoot()));
-            list(, $settings_stdout, ) = $future->resolve();
-            if (!preg_match('/OBJROOT = (.+)/', $settings_stdout, $matches)) {
-                throw new Exception('Unable to find OBJROOT configuration.');
-            }
-            $objroot = $matches[1];
-            $future = new ExecFuture("find %C -name Coverage.profdata", $objroot);
-            list(, $coverage_stdout, ) = $future->resolve();
-            $profdata_path = explode("\n", $coverage_stdout)[0];
-            $future = new ExecFuture("find %C | grep %C", $objroot, $this->coverage['product']);
-            list(, $product_stdout, ) = $future->resolve();
-            $product_path = explode("\n", $product_stdout)[0];
-            $future = new ExecFuture('%C show -use-color=false -instr-profile "%C" "%C"',
-                $this->covBinary, $profdata_path, $product_path);
-            $future->setCWD(Filesystem::resolvePath($this->getWorkingCopy()->getProjectRoot()));
-            try {
-                list($coverage, $coverage_error) = $future->resolvex();
-            } catch (CommandException $exc) {
-                if ($exc->getError() != 0) {
-                    throw $exc;
-                }
-            }
-        }
-         */
-        /*
-        public function run() {
-            $sample_results = array();
-
-            # example for a passed test result
-            $result_success = new ArcanistUnitTestResult();
-            $result_success->setName("A successful test");
-            $result_success->setResult(ArcanistUnitTestResult::RESULT_PASS);
-            $result_success->setDuration(1);
-
-            # example for a failed test result
-            $result_failure = new ArcanistUnitTestResult();
-            $result_failure->setName("A failed test");
-            $result_failure->setResult(ArcanistUnitTestResult::RESULT_FAIL);
-            $result_failure->setUserData(
-                "This test failed, because we wanted it to fail."
-            );
-
-            # add both results
-            $sample_results[] = $result_success;
-            $sample_results[] = $result_failure;
-
-            # return the result set
-            return $sample_results;
-        }
-*/
-
     }
 }
